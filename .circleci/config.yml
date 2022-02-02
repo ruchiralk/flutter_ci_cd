@@ -1,0 +1,163 @@
+version: 2.1
+
+orbs:
+  android: circleci/android@0.2.1
+  aws-cli: circleci/aws-cli@0.1.22
+  git: grubtech/git@dev:alpha
+
+working_directory: &working_directory
+                     ~/project
+
+parameters:
+  app_id:
+    description: Specify Application ID
+    type: string
+    default: 'POS-2'
+  env:
+    description: Specify environment
+    type: string
+    default: 'default'
+  build_variant:
+    description: Specify active build variant(Staging/Prod)
+    type: string
+    default: 'clientstage'
+  build_mode:
+    description: Specify active build mode(Release/Debug)
+    type: string
+    default: 'debug'
+  deploy:
+    description: Specify whether to trigger a deployment or not
+    type: boolean
+    default: true
+  release:
+    description: Specify whether to trigger a release or not
+    type: boolean
+    default: false
+  release_version:
+    description: Specify release version
+    type: string
+    default: ''
+  deploy_version:
+    description: Specify deploy version
+    type: string
+    default: ''
+  s3_bucket:
+    description: Specify service AWS S3 bucket
+    type: string
+    default: 'grubtech-apk-release'
+  gradle_property_file:
+    description: Specify gradle.properties file path
+    type: string
+    default: ./android/gradle.properties
+
+jobs:
+  apk-build-and-release:
+    executor: android/android
+    steps:
+      - checkout
+      - run:
+          name: git checkout
+          command: |
+            git checkout
+      - run:
+          name: "Setup build environment variables"
+          command: |
+            echo 'export BUILD_DATE=$(date '+%Y%m%d')' >> $BASH_ENV
+            echo 'export VERSION_NAME=${BUILD_DATE}-${CIRCLE_BUILD_NUM}' >> $BASH_ENV
+      #      - run:
+      #          name: Doing a git commit amend
+      #          command: |
+      #            git add << pipeline.parameters.gradle_property_file >>
+      #            git commit --amend -m '[ci skip] Release-Build-'${VERSION_NAME}-Version-<< pipeline.parameters.release_version >>
+      - run:
+          name: Build << pipeline.parameters.build_variant >> << pipeline.parameters.build_mode >> apk
+          command: |
+            ./gradlew clean assemble<< pipeline.parameters.build_variant >><< pipeline.parameters.build_mode >>
+      - git/tag:
+          tag: << pipeline.parameters.release_version >>
+      - git/tag-push:
+          tag: << pipeline.parameters.release_version >>
+      - run:
+          name: Doing a git push
+          command: |
+            git push -f origin $CIRCLE_BRANCH
+      - store_artifacts:
+          path: build/app/outputs/flutter-apk
+
+  build-pos-2-frontend-apk:
+    docker:
+      - image: cirrusci/flutter
+    steps:
+      - checkout
+      - run:
+          name: git checkout
+          command: |
+            git checkout
+      - run:
+          name: "Setup build environment variables"
+          command: |
+            if [ "<< pipeline.parameters.build_mode >>" = "Debug" ]
+            then
+              echo 'export APK_BUILD_MODE="debug"' >> $BASH_ENV
+            fi
+            if [ "<< pipeline.parameters.build_mode >>" = "Release" ]
+            then
+             echo 'export APK_BUILD_MODE="release"' >> $BASH_ENV
+            fi
+      - run:
+          name: Get flutter packages
+          command: |
+            flutter pub get
+      - run:
+          name: Code Generation
+          command: |
+            flutter pub run build_runner build --delete-conflicting-outputs
+      - run:
+          name: Build << pipeline.parameters.build_variant >> << pipeline.parameters.build_mode >> apk
+          command: |
+            flutter build apk --debug --flavor clientstage --dart-define=variant=clientstage --build-name=<< pipeline.parameters.app_id >>
+      - persist_to_workspace:
+          root: *working_directory
+          paths:
+            - build/app/outputs/flutter-apk
+
+  deploy-to-s3:
+    executor: aws-cli/default
+    steps:
+      - attach_workspace:
+          at: *working_directory
+      - aws-cli/setup:
+          profile-name: grubtech
+      - run:
+          name: Deploy to S3
+          command: |
+            aws s3 sync build/app/outputs/flutter-apk s3://<< pipeline.parameters.s3_bucket >>/<< pipeline.parameters.app_id >>/STG-V2
+
+workflows:
+  apk-build-and-deploy-to-s3-workflow:
+    when: << pipeline.parameters.deploy >>
+    jobs:
+      - build-pos-2-frontend-apk:
+          filters:
+            branches:
+              only: master
+      - deploy-to-s3:
+          requires:
+            - build-pos-2-frontend-apk
+          context: << pipeline.parameters.env >>
+          filters:
+            branches:
+              only: master
+
+  apk-build-and-release-workflow:
+    when: << pipeline.parameters.release >>
+    jobs:
+      - apk-build-and-release:
+          context: << pipeline.parameters.env >>
+      - deploy-to-s3:
+          requires:
+            - build-pos-2-frontend-apk
+          context: << pipeline.parameters.env >>
+          filters:
+            branches:
+              only: master
